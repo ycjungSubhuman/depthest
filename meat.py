@@ -18,20 +18,22 @@ Options for this script
 """
 WIDTH_IMAGE = 640
 HEIGHT_IMAGE = 480
+SIZE_WINDOW = (10, 10)
 options = {
     'root_checker_sample': 'data/checkerboard',
     'root_checker_inter': 'inter/intrinsic',
     'square_size': 20.0,
-    'checker_rows': 7,
-    'checker_cols': 9,
+    'checker_rows': 9,
+    'checker_cols': 7,
 
-    'root_stereo_sample': 'data/scene',
+    'root_stereo_sample': 'data/submission',
     'root_match_inter': 'inter/match',
+    'root_epipolar_inter': 'inter/epipolar',
     'thres_lowe': 0.7,
-    'num_keypoint': 5000,
-    'type_desc': 'ORB',
+    'num_keypoint': 1000,
+    'type_desc': 'AKAZE',
 
-    'ransac_radius': 0.1,
+    'ransac_radius': 0.01,
     'ransac_iter': 200,
 
     'root_rectify_inter': 'inter/rectify',
@@ -183,12 +185,28 @@ def get_all_pose(root_sample):
 def normalize_coordinate(pt):
     """
     Convert image space coordinate to [-1, 1]
+
+    Returns)
+    np.ndarray(shape=(2), dtype=np.float32)
     """
     pt = pt.copy()
     pt[0] = pt[0]/WIDTH_IMAGE*2 - 1.0
     pt[1] = pt[1]/HEIGHT_IMAGE*2 - 1.0
 
     return pt
+
+
+def unnormalize_coordinate(pt):
+    """
+    Convert [-1, 1] to discrete image space coordinate
+
+    Returns)
+    (int, int)
+    """
+    x = int((pt[0] + 1.0) * WIDTH_IMAGE // 2)
+    y = int((pt[1] + 1.0) * HEIGHT_IMAGE // 2)
+
+    return (x, y)
 
 
 def preprocess_match(key1, key2, matches):
@@ -496,6 +514,8 @@ def main_feature_matching():
 
     if options['type_desc'] == 'ORB':
         desc = cv2.ORB_create(nfeatures=int(options['num_keypoint']))
+    elif options['type_desc'] == 'AKAZE':
+        desc = cv2.AKAZE_create()
     elif options['type_desc'] == 'SIFT':
         desc = SIFTBootleg(nfeatures=int(options['num_keypoint']))
     else:
@@ -510,11 +530,15 @@ def main_feature_matching():
         path = os.path.join(
             options['root_stereo_sample'], 'scene{}.npy'.format(i))
         np.save(path, preprocess_match(key1, key2, matches))
+        print('correspondences for scene {} stored in ({})'.format(i, path))
         if options['root_match_inter']:
             image_vis = visualize_correspondence(
                 image_left, image_right, key1, key2, matches)
-            cv2.imwrite(os.path.join(
-                options['root_match_inter'], '{:04d}.jpg'.format(i)), image_vis)
+            path_vis = os.path.join(
+                options['root_match_inter'], '{:04d}.jpg'.format(i))
+            cv2.imwrite(path_vis, image_vis)
+            print(
+                'correspondences visualization for scene {} stored in ({})'.format(i, path_vis))
 
 
 """
@@ -570,13 +594,13 @@ def get_fundamental_matrix(parameter, rank2=True):
     rank2                   if true, impose rank-2 constraint
     """
     if rank2:
-        F_free = np.matrix(parameter).reshape((3, 3)).T
+        F_free = np.matrix(parameter).reshape((3, 3))
         u, s_free, vh = np.linalg.svd(F_free)
         s = np.array([s_free[0], s_free[1], 0.0])
         F = u @ np.diag(s) @ vh
     else:
-        F = np.matrix(parameter).reshape((3, 3)).T
-    return F / F[2, 2]
+        F = np.matrix(parameter).reshape((3, 3))
+    return F / F[2,2]
 
 
 def homogeneous(x):
@@ -646,7 +670,7 @@ class CameraExtrinsicProblem(RegressionProblem):
         assert len(observations) == self.dof()
         A = formulate_8point_matrix(observations)
         u, s, vh = np.linalg.svd(A)
-        parameter = vh.T[:, -1].A1
+        parameter = vh[-1, :]
         return parameter
 
     def dof(self):
@@ -715,6 +739,39 @@ def estimate_fundamental_matrix(pair_point):
     F = get_fundamental_matrix(parameter)
     return F
 
+def visualize_epipolar_line(im1, im2, pair_point, F):
+    """
+    Given two images and fundamental matrix, draw epipolar lines on both image
+    for detected correspondences
+    """
+
+    im1 = cv2.cvtColor(im1.copy(), cv2.COLOR_GRAY2BGR)
+    im2 = cv2.cvtColor(im2.copy(), cv2.COLOR_GRAY2BGR)
+
+    for i in range(pair_point.shape[0]):
+        x1 = np.matrix(homogeneous(pair_point[i, 0])).T
+        x2 = np.matrix(homogeneous(pair_point[i, 1])).T
+
+        l1 = (x2.T @ F).A1
+        l2 = (F @ x1).A1
+
+        c = tuple(np.random.randint(0, 255, 3).tolist())
+        pstart1 = unnormalize_coordinate(hnormalize(
+            np.cross(np.array([1.0, 0.0, -1.0]), l1)))
+        pend1 = unnormalize_coordinate(hnormalize(
+            np.cross(np.array([1.0, 0.0,  1.0]), l1)))
+        cv2.line(im1, pstart1, pend1, c)
+        cv2.circle(im2, unnormalize_coordinate(hnormalize(x2)), 5, c)
+
+        pstart2 = unnormalize_coordinate(hnormalize(
+            np.cross(np.array([1.0, 0.0, -1.0]), l2)))
+        pend2 = unnormalize_coordinate(hnormalize(
+            np.cross(np.array([1.0, 0.0,  1.0]), l2)))
+        cv2.line(im2, pstart2, pend2, c)
+        cv2.circle(im1, unnormalize_coordinate(hnormalize(x1)), 5, c)
+
+    return np.hstack((im1, im2))
+
 
 def main_fundamental():
     """
@@ -725,6 +782,8 @@ def main_fundamental():
     print('--------------------------------------------------------------------')
     print('Task 1-4')
     print('--------------------------------------------------------------------')
+
+    prepare_root_inter(options['root_epipolar_inter'])
     pairs_image = get_all_scene_images(options['root_stereo_sample'])
     pairs_point = get_all_keypoint_matches(options['root_stereo_sample'])
 
@@ -736,6 +795,12 @@ def main_fundamental():
         print('F for scene {} ({}) = '.format(i, path))
         print(F)
         np.save(path, F)
+        image_vis = visualize_epipolar_line(
+            image_left, image_right, pair_point, F)
+        path_vis = os.path.join(
+            options['root_epipolar_inter'], 'scene{}_epipolar.jpg'.format(i))
+        cv2.imwrite(path_vis, image_vis)
+        print('Epipolar line visualization image is saved in {}'.format(path_vis))
 
 
 def get_essential_matrix(K, F):
@@ -743,7 +808,8 @@ def get_essential_matrix(K, F):
     Calculate essential matrix from a intrinsic matrix K and 
     a fundamental matrix F
     """
-    return K.T @ F @ K
+    E = K.T @ F @ K
+    return E / E[2,2]
 
 
 def main_essential():
@@ -778,8 +844,6 @@ def decompose_essential_matrix(E):
           np.ndarray(shape=(3,), dtype=np.float32)))
     """
     u, s, vh = np.linalg.svd(E)
-    print('s=')
-    print(s)
     u = np.matrix(u)
     vh = np.matrix(vh)
     W = np.matrix([[0.0, -1.0, 0.0],
@@ -787,7 +851,7 @@ def decompose_essential_matrix(E):
                    [0.0, 0.0, 1.0]])
 
     Rs = [np.array(u @ W @ vh), np.array(u @ W.T @ vh)]
-    ts = [-u[:, 2].A1, u[:, 2].A1]
+    ts = [-u[:, 2], u[:, 2]]
 
     return list(product(Rs, ts))
 
@@ -829,39 +893,46 @@ def rectify_images(im1, im2, K, distcoeffs, R, t):
     """
     Calculate rectified images
     """
-    R1, R2, P1, P2, Q, ROI1, ROI2 = cv2.stereoRectify(
-        K, distcoeffs, K, distcoeffs, (WIDTH_IMAGE, HEIGHT_IMAGE), R, t)
 
-    map1, map2 = cv2.initUndistortRectifyMap(
-        K, distcoeffs, R1, K, (WIDTH_IMAGE, HEIGHT_IMAGE), cv2.CV_32FC2)
-    rectified_left = cv2.remap(im1, map1, map2, cv2.INTER_LINEAR)
-    map1, map2 = cv2.initUndistortRectifyMap(
-        K, distcoeffs, R2, K, (WIDTH_IMAGE, HEIGHT_IMAGE), cv2.CV_32FC2)
-    rectified_right = cv2.remap(im2, map1, map2, cv2.INTER_LINEAR)
+    R1, R2, P1, P2, Q, ROI1, ROI2 = cv2.stereoRectify(
+        K, distcoeffs, K, distcoeffs, (WIDTH_IMAGE, HEIGHT_IMAGE), R, t, flags=cv2.CALIB_ZERO_DISPARITY)
+
+    mapa1, mapa2 = cv2.initUndistortRectifyMap(
+        K, distcoeffs, R1, P1, (WIDTH_IMAGE, HEIGHT_IMAGE), cv2.CV_32FC1)
+    rectified_left = cv2.remap(im1, mapa1, mapa2, cv2.INTER_LINEAR)
+    mapb1, mapb2 = cv2.initUndistortRectifyMap(
+        K, distcoeffs, R2, P2, (WIDTH_IMAGE, HEIGHT_IMAGE), cv2.CV_32FC1)
+    rectified_right = cv2.remap(im2, mapb1, mapb2, cv2.INTER_LINEAR)
 
     return rectified_left, rectified_right
+
 
 def draw_horizontal_lines(im):
     """
     Draw red horizontal lines on image for visualization
     """
-    im = im.copy()
+    im = cv2.cvtColor(im.copy(), cv2.COLOR_GRAY2BGR)
     NUM_LINES = 20
     interval = HEIGHT_IMAGE // NUM_LINES
     for i in range(NUM_LINES):
-        cv2.line(im, (0, interval*i), (WIDTH_IMAGE, interval*i), (255, 255, 255))
+        cv2.line(im, (0, interval*i), (WIDTH_IMAGE, interval*i), (255, 0, 0))
     return im
+
 
 def visualize_rectified_image_pair(im1, im2):
     """
-    Create a merged image with horizontal lines on them
+    Create a side-by-side image with horizontal lines on them
     """
     return np.hstack(
-        (draw_horizontal_lines(im1), 
+        (draw_horizontal_lines(im1),
          draw_horizontal_lines(im2)))
-        
+
 
 def main_rectify():
+    print('--------------------------------------------------------------------')
+    print('Task 2-1')
+    print('--------------------------------------------------------------------')
+
     prepare_root_inter(options['root_rectify_inter'])
     K = np.load(os.path.join(options['root_checker_sample'], 'K.npy'))
     distcoeffs = np.load(os.path.join(
@@ -877,11 +948,28 @@ def main_rectify():
         for j, (R, t) in enumerate(Ts):
             rectified_left, rectified_right = \
                 rectify_images(image_left, image_right, K, distcoeffs, R, t)
+            mask_left, mask_right = \
+                rectify_images(255*np.ones((WIDTH_IMAGE, HEIGHT_IMAGE)), np.ones(
+                    (WIDTH_IMAGE, HEIGHT_IMAGE)), K, distcoeffs, R, t)
             path = os.path.join(
                 options['root_rectify_inter'], 'scene{}_option{}.jpg'.format(i, j))
             print('Rectified images are stored in ({})'.format(path))
+
+            path_left = os.path.join(
+                options['root_rectify_inter'], 'scene{}_option{}_left.jpg'.format(i, j))
+            path_right = os.path.join(
+                options['root_rectify_inter'], 'scene{}_option{}_right.jpg'.format(i, j))
+            path_left_mask = os.path.join(
+                options['root_rectify_inter'], 'scene{}_option{}_left_mask.jpg'.format(i, j))
+            path_right_mask = os.path.join(
+                options['root_rectify_inter'], 'scene{}_option{}_right_mask.jpg'.format(i, j))
+            cv2.imwrite(path_left, rectified_left)
+            cv2.imwrite(path_right, rectified_right)
+            cv2.imwrite(path_left_mask, mask_left)
+            cv2.imwrite(path_right_mask, mask_right)
             cv2.imwrite(
                 path, visualize_rectified_image_pair(rectified_left, rectified_right))
+
 
 
 """
@@ -892,8 +980,8 @@ main
 
 if __name__ == '__main__':
     # main_camera_intrinsic()
-    # main_feature_matching()     # Task 1-3
-    # main_fundamental()          # Task 1-4
-    # main_essential()            # Task 1-5
-    # main_decomposition()        # Task 1-6
+    main_feature_matching()     # Task 1-3
+    main_fundamental()          # Task 1-4
+    main_essential()            # Task 1-5
+    main_decomposition()        # Task 1-6
     main_rectify()              # Task 2-1
