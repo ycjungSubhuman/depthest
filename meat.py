@@ -4,6 +4,7 @@ import shutil
 import os
 import cv2
 import re
+import random
 import numpy as np
 
 from concurrent.futures import ProcessPoolExecutor
@@ -12,7 +13,31 @@ from functools import partial
 
 """
 -------------------------------------------------------------------------------
-Utility functions that most functions depend on
+Options for this script
+-------------------------------------------------------------------------------
+"""
+WIDTH_IMAGE = 640
+HEIGHT_IMAGE = 480
+options = {
+    'root_checker_sample': 'data/checkerboard',
+    'root_checker_inter': 'inter/intrinsic',
+    'square_size': 20.0,
+    'checker_rows': 7,
+    'checker_cols': 9,
+
+    'root_stereo_sample': 'data/scene',
+    'root_match_inter': 'inter/match',
+    'thres_lowe': 0.7,
+    'num_keypoint': 5000,
+    'type_desc': 'ORB',
+
+    'ransac_radius': 0.1,
+    'ransac_iter': 100
+}
+
+"""
+-------------------------------------------------------------------------------
+Utility functions that many functions depend on
 -------------------------------------------------------------------------------
 """
 
@@ -38,6 +63,83 @@ def prepare_root_inter(root_inter):
     os.makedirs(root_inter, exist_ok=True)
 
     return root_inter
+
+
+def normalize_image_size(im):
+    """
+    Fix image size
+    """
+    return cv2.resize(im, (WIDTH_IMAGE, HEIGHT_IMAGE), interpolation=cv2.INTER_AREA)
+
+
+def get_all_scene_images(root_sample):
+    """
+    Read all image pairs in root_sample
+
+    Note)
+    image pairs should have filename
+        'scene%d_0.jpg', 'scene%d_1.jpg'
+
+    Returns)
+    list((np.ndarray(shape=(w,h), dtype=np.uint8), 
+            np.ndarray(shape=(w,h), dtype=np.uint8))
+    """
+    i = 0
+    pair_images = []
+    while True:
+        path_left = os.path.join(
+            root_sample, 'scene{}_{}.jpg'.format(i, 0))
+        path_right = os.path.join(
+            root_sample, 'scene{}_{}.jpg'.format(i, 1))
+
+        exists_pair = os.path.exists(
+            path_left) and os.path.exists(path_right)
+        if not exists_pair:
+            break
+        pair_images.append(
+            (normalize_image_size(cv2.imread(path_left, cv2.IMREAD_GRAYSCALE)),
+                normalize_image_size(cv2.imread(path_right, cv2.IMREAD_GRAYSCALE))))
+        i += 1
+    return pair_images
+
+
+def get_all_keypoint_matches(root_sample):
+    """
+    Read all keypoint matches in root_sample
+
+    Note)
+    keypoint match files should have filename
+        'scene%d.npy'
+
+    Returns)
+    list(np.ndarray(shape=(N, 2, 2), dtype=np.float32))
+    """
+    i = 0
+    keypoint_matches = []
+    while True:
+        path = os.path.join(root_sample, 'scene{}.npy'.format(i))
+        if not os.path.exists(path):
+            break
+        elem = np.load(path)
+        keypoint_matches.append(elem)
+        i += 1
+    return keypoint_matches
+
+def preprocess_match(key1, key2, matches):
+    """
+    Convert two list(cv2.KeyPoint) into normalized coordinate
+    list(list(np.ndarray(shape=(2), dtype=np.float32)))
+    """
+    result = []
+    for m in matches:
+        pt1 = np.array(key1[m.queryIdx].pt, dtype=np.float32)
+        pt2 = np.array(key2[m.trainIdx].pt, dtype=np.float32)
+        pt1[0] = pt1[0]/WIDTH_IMAGE*2 - 1.0
+        pt1[1] = pt1[1]/HEIGHT_IMAGE*2 - 1.0
+        pt2[0] = pt2[0]/WIDTH_IMAGE*2 - 1.0
+        pt2[1] = pt2[1]/HEIGHT_IMAGE*2 - 1.0
+        result.append([pt1, pt2])
+    return result
 
 
 """
@@ -102,7 +204,8 @@ def get_calibration_samples(root_sample):
                     'Some images have different shape: {}. Prev: {}, Curr: {}'
                     .format(paths[i], size, elem.shape[:2]))
 
-    result = [cv2.imread(path, cv2.IMREAD_GRAYSCALE) for path in paths]
+    result = [
+        normalize_image_size(cv2.imread(path, cv2.IMREAD_GRAYSCALE)) for path in paths]
     check_image(result)
     return result
 
@@ -195,47 +298,21 @@ def calibrate(root_sample, root_inter, square_size,
 
 def main_camera_intrinsic():
     """
-    Calibrate images from checkerboard samples
-
-    usage:
-        camera_intrinsic.py [--root_sample <path>] [--root_inter <path>]
-            [--square_size <float> (millimeter)]
-            [--checker_rows <int>] [--checker_cols <int>]
+    Calibrate images from checkerboard samples. 
+    Print camera intrinsic matrix K and RMS error.
+    Saves K matrix under root_checker_sample
     """
-    ROOT_SAMPLE_DEFAULT = 'data/checkerboard'
-    ROOT_INTER_DEFAULT = 'inter/intrinsic'
-    SQUARE_SIZE_DEFAULT = 20.0
-    CHECKER_ROWS_DEFAULT = 7
-    CHECKER_COLS_DEFAULT = 9
-
-    def get_options():
-        """
-        Parse command line arguments
-        """
-        args, _ = getopt.gnu_getopt(sys.argv[1:], '', [
-                                'root_sample=', 'root_inter=', 'square_size=',
-                                'checker_rows=', 'checker_cols='])
-        args = dict(args)
-        args.setdefault('--root_sample', ROOT_SAMPLE_DEFAULT)
-        args.setdefault('--root_inter', ROOT_INTER_DEFAULT)
-        args.setdefault('--square_size', SQUARE_SIZE_DEFAULT)
-        args.setdefault('--checker_rows', CHECKER_ROWS_DEFAULT)
-        args.setdefault('--checker_cols', CHECKER_COLS_DEFAULT)
-
-        return args
-
-    options = get_options()
     rms, K = calibrate(
-        root_sample=options['--root_sample'],
-        root_inter=prepare_root_inter(options['--root_inter']),
-        square_size=float(options['--square_size']),
-        checker_rows=int(options['--checker_rows']),
-        checker_cols=int(options['--checker_cols']))
+        root_sample=options['root_checker_sample'],
+        root_inter=prepare_root_inter(options['root_checker_inter']),
+        square_size=float(options['square_size']),
+        checker_rows=int(options['checker_rows']),
+        checker_cols=int(options['checker_cols']))
 
     print('Intrinsic matrix K: ')
     print(K)
     print('RMS: {}'.format(rms))
-    np.save(os.path.join(options['--root_sample'], 'K.npy'), K)
+    np.save(os.path.join(options['root_checker_sample'], 'K.npy'), K)
 
 
 """
@@ -252,19 +329,6 @@ class SIFTBootleg(cv2.Feature2D):
 
     def __init__(self, *args, **kwargs):
         pass
-
-
-class ORBWrapper(cv2.Feature2D):
-    """
-    A wrapper for OpenCV ORB feature detector
-
-    Note)
-    The purpose of this wrapper is to match the signatures for the initializer
-    with the SIFT class
-    """
-
-    def __init__(self, *args, **kwargs):
-        self = cv2.ORB_create(*args, **kwargs)
 
 
 def extract_feature(image1, image2, desc):
@@ -312,7 +376,7 @@ def match_correspondence(
     thres_lowe                  a ratio threshold for lowe test
 
     Returns)
-    a list of length-2 list of cv2.DMatch
+    list(cv2.DMatch)
     """
     matcher = cv2.DescriptorMatcher_create(id_type_matcher)
     matches = matcher.knnMatch(
@@ -349,80 +413,33 @@ def visualize_correspondence(image1, image2, key1, key2, matches):
 
 
 def main_feature_matching():
-    ROOT_SAMPLE_DEFAULT = 'data/scene'
-    ROOT_INTER_DEFAULT = 'inter/match'
-    NUM_KEYPOINT_DEFAULT = 500
-    THRES_LOWE_DEFAULT = 0.7
-    TYPE_DESC_DEFAULT = 'ORB'
+    """
+    Perform feature matching and save intermediate results
+    """
 
-    def get_options():
-        """
-        Parse command line arguments
-        """
-        args, _ = getopt.getopt(sys.argv[1:], '', [
-                                'root_sample=', 'root_inter=',
-                                'thres_lowe=', 'num_keypoint=',
-                                'type_desc='])
-        args = dict(args)
-        args.setdefault('--root_sample', ROOT_SAMPLE_DEFAULT)
-        args.setdefault('--root_inter', ROOT_INTER_DEFAULT)
-        args.setdefault('--thres_lowe', THRES_LOWE_DEFAULT)
-        args.setdefault('--num_keypoint', NUM_KEYPOINT_DEFAULT)
-        args.setdefault('--type_desc', TYPE_DESC_DEFAULT)
+    prepare_root_inter(options['root_match_inter'])
+    samples = get_all_scene_images(options['root_stereo_sample'])
 
-        return args
-
-    def get_all_scene_images(root_sample):
-        """
-        Read all image pairs in root_sample
-
-        Note)
-        image pairs should have filename
-            'scene%d_0.jpg', 'scene%d_1.jpg'
-
-        Returns)
-        list((np.ndarray(shape=(w,h), dtype=np.uint8), 
-              np.ndarray(shape=(w,h), dtype=np.uint8))
-        """
-        i = 0
-        pair_images = []
-        while True:
-            path_left = os.path.join(
-                root_sample, 'scene{}_{}.jpg'.format(i, 0))
-            path_right = os.path.join(
-                root_sample, 'scene{}_{}.jpg'.format(i, 1))
-
-            exists_pair = os.path.exists(
-                path_left) and os.path.exists(path_right)
-            if not exists_pair:
-                break
-            pair_images.append((cv2.imread(path_left, cv2.IMREAD_GRAYSCALE),
-                                cv2.imread(path_right, cv2.IMREAD_GRAYSCALE)))
-            i += 1
-        return pair_images
-
-    options = get_options()
-    prepare_root_inter(options['--root_inter'])
-    samples = get_all_scene_images(options['--root_sample'])
-
-    if options['--type_desc'] == 'ORB':
-        desc = cv2.ORB_create(nfeatures=int(options['--num_keypoint']))
-    elif options['--type_desc'] == 'SIFT':
-        desc = SIFTBootleg(nfeatures=int(options['--num_keypoint']))
+    if options['type_desc'] == 'ORB':
+        desc = cv2.ORB_create(nfeatures=int(options['num_keypoint']))
+    elif options['type_desc'] == 'SIFT':
+        desc = SIFTBootleg(nfeatures=int(options['num_keypoint']))
     else:
         raise Exception('Unidentified type_desc: {}'.format(
-            options['--type_desc']))
+            options['type_desc']))
 
     for i, (image_left, image_right) in enumerate(samples):
         key1, key2, feat1, feat2 = extract_feature(
             image_left, image_right, desc)
         matches = match_correspondence(
-            feat1, feat2, thres_lowe=float(options['--thres_lowe']))
-        if options['--root_inter']:
+            feat1, feat2, thres_lowe=float(options['thres_lowe']))
+        path = os.path.join(options['root_stereo_sample'], 'scene{}.npy'.format(i))
+        np.save(path, preprocess_match(key1, key2, matches))
+        if options['root_match_inter']:
             image_vis = visualize_correspondence(
                 image_left, image_right, key1, key2, matches)
             cv2.imwrite(os.path.join(
-                options['--root_inter'], '{:04d}.jpg'.format(i)), image_vis)
+                options['root_match_inter'], '{:04d}.jpg'.format(i)), image_vis)
 
 
 """
@@ -432,6 +449,212 @@ Camera extrinsic parameter optimization
 """
 
 
+class RegressionProblem:
+    """
+    Regress a value from samples
+    """
+
+    def cost(self, parameter, observation):
+        """
+        Calculate cost when given a set of parameters and a data point
+
+        Args)
+        parameter               model argument
+        observation             a single observed data such as a point
+
+        Returns)
+        float
+        """
+        raise NotImplementedError()
+
+    def estimate(self, observation):
+        """
+        Estimate parameters from observation
+        """
+        raise NotImplementedError()
+
+    def dof(self):
+        """
+        Get the degree of freedom
+        """
+        raise NotImplementedError()
+
+
+    def dim_parameter(self):
+        """
+        Get the number of paramters
+        """
+        raise NotImplementedError()
+
+
+def get_fundamental_matrix(parameter, rank2=False):
+    """
+    Create a 3x3 fundamental matrix from a 9-dimension parameter
+
+    Args)
+    parameter               np.ndarray(shape=(9), dtype=np.float32)
+    rank2                   if true, impose rank-2 constraint
+    """
+    if rank2:
+        F_free = np.matrix(parameter).reshape((3, 3)).T
+        u, s_free, vh = np.linalg.svd(F_free)
+        s = np.array([s_free[0], s_free[1], 0.0])
+        F = u @ s @ vh
+    else:
+        F = np.matrix(parameter).reshape((3, 3)).T
+    return F / F[2,2]
+
+
+def homogeneous(x):
+    """
+    Get homogenous vector
+    """
+    return np.concatenate((x, np.ones(1, dtype=np.float32)))
+
+
+def hnormalize(x):
+    """
+    Convert homogeneous vector to original 
+    """
+    return x[:-1] / x[-1]
+
+
+def formulate_8point_matrix(observations):
+    """
+    Calculate A matrix used in 8-point fundamental 
+    matrix calculation
+
+    Args)
+    observations             list(np.ndarray(shape=(2,2), dtype=np.float32))
+    """
+    assert len(observations) == 8
+    elems = []
+    for observation in observations:
+        x1 = observation[0]
+        x2 = observation[1]
+        elems.append([x2[0]*x1[0], x2[0]*x1[1], x2[0],
+                      x2[1]*x1[0], x2[1]*x1[1], x2[1], x1[0], x1[1], 1.0])
+    A = np.matrix(elems)
+
+    return A
+
+
+class CameraExtrinsicProblem(RegressionProblem):
+    """
+    Given parameters for fundamental metrix F,
+    calculate x1.T mm F mm x2
+    """
+
+    def cost(self, parameter, observation):
+        """
+        Args)
+        parameter               np.ndarray(shape=(8), dtype=np.float32)
+        observation             list(np.ndarray(shape=(2), dtype=np.float32))
+                                x1 := observation[0]
+                                x1 := observation[1]
+        """
+        F = get_fundamental_matrix(parameter)
+        x1 = np.matrix(homogeneous(observation[0])).T
+        x2 = np.matrix(homogeneous(observation[1])).T
+        
+        xF = (x2.T @ F).A1
+        xFx = (x2.T @ F @ x1)[0, 0]
+        Fx = (F @ x1).A1
+
+        cost = xFx*(1.0/(xF[0]**2 + xF[1]**2) + 1.0/(Fx[0]**2 + Fx[1]**2))
+        return cost
+
+    def estimate(self, observations):
+        """
+        Args)
+        observations            list(np.ndarray(shape=(2,2), dtype=np.float32))
+        """
+        assert len(observations) == self.dof()
+        A = formulate_8point_matrix(observations)
+        u, s, vh = np.linalg.svd(A)
+        parameter = vh.T[:,-1].A1
+        return parameter
+
+    def dof(self):
+        return 8
+
+    def dim_parameter(self):
+        return (9,)
+
+
+class RANSAC:
+    """
+    RANSAC regression
+    """
+
+    def __init__(self, radius, iter):
+        """
+        Args)
+        radius                  cost value radius
+        iter                    number of iterations
+        """
+        self.radius = radius
+        self.iter = iter
+        self.rand = random.Random(0)  # fixed seed for reproducable results
+
+    def solve(self, problem, population):
+        """
+        Solve a regression problem using RANSAC
+
+        Args)
+        problem                 A RegressionProblem instance
+        population              np.ndarray(shape=(N,2,2), dtype=np.float32)))
+        """
+        consensus_parameter_pairs = []
+
+        for _ in range(self.iter):
+            samples = self.rand.sample(
+                list(population), problem.dof())
+            parameter = problem.estimate(samples)
+
+            costs = map(partial(problem.cost, parameter), population)
+            consensus = len(list(filter(lambda c: c < self.radius, costs)))
+            consensus_parameter_pairs.append((consensus, parameter))
+
+        best = sorted(consensus_parameter_pairs, key=lambda p: p[0])[-1]
+        print('RANSAC: selected the candidate with {} consensus'.format(best[0]))
+        return best[1]
+
+
+def estimate_fundamental_matrix(pair_point):
+    """
+    Estimate fundamental matrix from keypoints on an image to that of 
+    another image
+
+    Args)
+    pair_point                  np.ndarray(shape=(N,2,2), dtype=np.float32)
+
+    Returns)
+    Fundamental matrix. np.ndarray(shape=(3,3), dtype=np.float)
+    """
+    ransac = RANSAC(options['ransac_radius'], options['ransac_iter'])
+    problem = CameraExtrinsicProblem()
+    population = pair_point
+
+    parameter = ransac.solve(problem, population)
+    F = get_fundamental_matrix(parameter)
+    return F
+
+
+def main_fundamental_matrix():
+    """
+    Estimate fundamental matrix from 
+    """
+    pairs_image = get_all_scene_images(options['root_stereo_sample'])
+    pairs_point = get_all_keypoint_matches(options['root_stereo_sample'])
+
+    for i, ((image_left, image_right), pair_point) \
+            in enumerate(zip(pairs_image, pairs_point)):
+        F = estimate_fundamental_matrix(pair_point)
+        print('F =')
+        print(F)
+
+
 """
 -------------------------------------------------------------------------------
 main
@@ -439,5 +662,6 @@ main
 """
 
 if __name__ == '__main__':
-    # main_camera_intrinsic()
+    #main_camera_intrinsic()
     main_feature_matching()
+    main_fundamental_matrix()
