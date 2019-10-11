@@ -8,7 +8,7 @@ import random
 import numpy as np
 
 from concurrent.futures import ProcessPoolExecutor
-from itertools import repeat
+from itertools import repeat, product
 from functools import partial
 
 """
@@ -32,7 +32,9 @@ options = {
     'type_desc': 'ORB',
 
     'ransac_radius': 0.1,
-    'ransac_iter': 100
+    'ransac_iter': 200,
+
+    'root_rectify_inter': 'inter/rectify',
 }
 
 """
@@ -103,6 +105,25 @@ def get_all_scene_images(root_sample):
     return pair_images
 
 
+def get_all_npy(root_sample, format):
+    """
+    Read all .npy file in root_sample
+
+    Returns)
+    list(np.ndarray)
+    """
+    i = 0
+    keypoint_matches = []
+    while True:
+        path = os.path.join(root_sample, format.format(i))
+        if not os.path.exists(path):
+            break
+        elem = np.load(path)
+        keypoint_matches.append(elem)
+        i += 1
+    return keypoint_matches
+
+
 def get_all_keypoint_matches(root_sample):
     """
     Read all keypoint matches in root_sample
@@ -114,16 +135,61 @@ def get_all_keypoint_matches(root_sample):
     Returns)
     list(np.ndarray(shape=(N, 2, 2), dtype=np.float32))
     """
-    i = 0
-    keypoint_matches = []
-    while True:
-        path = os.path.join(root_sample, 'scene{}.npy'.format(i))
-        if not os.path.exists(path):
-            break
-        elem = np.load(path)
-        keypoint_matches.append(elem)
-        i += 1
-    return keypoint_matches
+    return get_all_npy(root_sample, 'scene{}.npy')
+
+
+def get_all_F(root_sample):
+    """
+    Read all fundamental matrices in root_sample
+
+    Note)
+    keypoint match files should have filename
+        'scene%d_F.npy'
+
+    Returns)
+    list(np.ndarray(shape=(3, 3), dtype=np.float32))
+    """
+    return get_all_npy(root_sample, 'scene{}_F.npy')
+
+
+def get_all_E(root_sample):
+    """
+    Read all essential matrices in root_sample
+
+    Note)
+    keypoint match files should have filename
+        'scene%d_E.npy'
+
+    Returns)
+    list(np.ndarray(shape=(3, 3), dtype=np.float32))
+    """
+    return get_all_npy(root_sample, 'scene{}_E.npy')
+
+
+def get_all_pose(root_sample):
+    """
+    Read all pose files in root_sample
+
+    Note)
+    keypoint match files should have filename
+        'scene%d_pose.npz'
+
+    Returns)
+    list(npz)
+    """
+    return get_all_npy(root_sample, 'scene{}_pose.npz')
+
+
+def normalize_coordinate(pt):
+    """
+    Convert image space coordinate to [-1, 1]
+    """
+    pt = pt.copy()
+    pt[0] = pt[0]/WIDTH_IMAGE*2 - 1.0
+    pt[1] = pt[1]/HEIGHT_IMAGE*2 - 1.0
+
+    return pt
+
 
 def preprocess_match(key1, key2, matches):
     """
@@ -132,12 +198,10 @@ def preprocess_match(key1, key2, matches):
     """
     result = []
     for m in matches:
-        pt1 = np.array(key1[m.queryIdx].pt, dtype=np.float32)
-        pt2 = np.array(key2[m.trainIdx].pt, dtype=np.float32)
-        pt1[0] = pt1[0]/WIDTH_IMAGE*2 - 1.0
-        pt1[1] = pt1[1]/HEIGHT_IMAGE*2 - 1.0
-        pt2[0] = pt2[0]/WIDTH_IMAGE*2 - 1.0
-        pt2[1] = pt2[1]/HEIGHT_IMAGE*2 - 1.0
+        pt1 = normalize_coordinate(
+            np.array(key1[m.queryIdx].pt, dtype=np.float32))
+        pt2 = normalize_coordinate(
+            np.array(key2[m.trainIdx].pt, dtype=np.float32))
         result.append([pt1, pt2])
     return result
 
@@ -261,8 +325,10 @@ def calibrate(root_sample, root_inter, square_size,
     checker_cols        number of checkers in columns
 
     Returns)
-    (camera intrinsic matrix K, rms error).
-        (numpy.ndarray(shape=(3,3), dtype=np.float32), float)
+    (rms error, camera intrinsic matrix K, distortion coefficient).
+        (float, 
+         numpy.ndarray(shape=(3,3), dtype=np.float32), 
+         np.ndarray(shape=(5), dtype=np.float32))
     """
     def get_pts_checker():
         """
@@ -289,11 +355,11 @@ def calibrate(root_sample, root_inter, square_size,
     print('{:d} out of {:d} images are valid'.format(
         len(corners_detected), len(corners)))
 
-    rms, K, _, _, _ = cv2.calibrateCamera(
+    rms, K, distcoeffs, _, _ = cv2.calibrateCamera(
         [corners_ref for _ in range(len(corners_detected))], corners_detected,
         (samples[0].shape[0], samples[0].shape[1]), None, None)
 
-    return rms, K
+    return rms, K, distcoeffs
 
 
 def main_camera_intrinsic():
@@ -302,7 +368,7 @@ def main_camera_intrinsic():
     Print camera intrinsic matrix K and RMS error.
     Saves K matrix under root_checker_sample
     """
-    rms, K = calibrate(
+    rms, K, distcoeffs = calibrate(
         root_sample=options['root_checker_sample'],
         root_inter=prepare_root_inter(options['root_checker_inter']),
         square_size=float(options['square_size']),
@@ -311,8 +377,12 @@ def main_camera_intrinsic():
 
     print('Intrinsic matrix K: ')
     print(K)
+    print('Distortion coefficients: ')
+    print(distcoeffs)
     print('RMS: {}'.format(rms))
     np.save(os.path.join(options['root_checker_sample'], 'K.npy'), K)
+    np.save(os.path.join(
+        options['root_checker_sample'], 'dist.npy'), distcoeffs)
 
 
 """
@@ -415,8 +485,12 @@ def visualize_correspondence(image1, image2, key1, key2, matches):
 def main_feature_matching():
     """
     Perform feature matching and save intermediate results
-    """
 
+    Task 1-3
+    """
+    print('--------------------------------------------------------------------')
+    print('Task 1-3')
+    print('--------------------------------------------------------------------')
     prepare_root_inter(options['root_match_inter'])
     samples = get_all_scene_images(options['root_stereo_sample'])
 
@@ -433,7 +507,8 @@ def main_feature_matching():
             image_left, image_right, desc)
         matches = match_correspondence(
             feat1, feat2, thres_lowe=float(options['thres_lowe']))
-        path = os.path.join(options['root_stereo_sample'], 'scene{}.npy'.format(i))
+        path = os.path.join(
+            options['root_stereo_sample'], 'scene{}.npy'.format(i))
         np.save(path, preprocess_match(key1, key2, matches))
         if options['root_match_inter']:
             image_vis = visualize_correspondence(
@@ -479,7 +554,6 @@ class RegressionProblem:
         """
         raise NotImplementedError()
 
-
     def dim_parameter(self):
         """
         Get the number of paramters
@@ -487,7 +561,7 @@ class RegressionProblem:
         raise NotImplementedError()
 
 
-def get_fundamental_matrix(parameter, rank2=False):
+def get_fundamental_matrix(parameter, rank2=True):
     """
     Create a 3x3 fundamental matrix from a 9-dimension parameter
 
@@ -499,10 +573,10 @@ def get_fundamental_matrix(parameter, rank2=False):
         F_free = np.matrix(parameter).reshape((3, 3)).T
         u, s_free, vh = np.linalg.svd(F_free)
         s = np.array([s_free[0], s_free[1], 0.0])
-        F = u @ s @ vh
+        F = u @ np.diag(s) @ vh
     else:
         F = np.matrix(parameter).reshape((3, 3)).T
-    return F / F[2,2]
+    return F / F[2, 2]
 
 
 def homogeneous(x):
@@ -556,7 +630,7 @@ class CameraExtrinsicProblem(RegressionProblem):
         F = get_fundamental_matrix(parameter)
         x1 = np.matrix(homogeneous(observation[0])).T
         x2 = np.matrix(homogeneous(observation[1])).T
-        
+
         xF = (x2.T @ F).A1
         xFx = (x2.T @ F @ x1)[0, 0]
         Fx = (F @ x1).A1
@@ -572,7 +646,7 @@ class CameraExtrinsicProblem(RegressionProblem):
         assert len(observations) == self.dof()
         A = formulate_8point_matrix(observations)
         u, s, vh = np.linalg.svd(A)
-        parameter = vh.T[:,-1].A1
+        parameter = vh.T[:, -1].A1
         return parameter
 
     def dof(self):
@@ -617,7 +691,8 @@ class RANSAC:
             consensus_parameter_pairs.append((consensus, parameter))
 
         best = sorted(consensus_parameter_pairs, key=lambda p: p[0])[-1]
-        print('RANSAC: selected the candidate with {} consensus'.format(best[0]))
+        print(
+            'RANSAC: selected the candidate with {} consensus'.format(best[0]))
         return best[1]
 
 
@@ -641,18 +716,172 @@ def estimate_fundamental_matrix(pair_point):
     return F
 
 
-def main_fundamental_matrix():
+def main_fundamental():
     """
     Estimate fundamental matrix from 
+
+    Task 1-4
     """
+    print('--------------------------------------------------------------------')
+    print('Task 1-4')
+    print('--------------------------------------------------------------------')
     pairs_image = get_all_scene_images(options['root_stereo_sample'])
     pairs_point = get_all_keypoint_matches(options['root_stereo_sample'])
 
     for i, ((image_left, image_right), pair_point) \
             in enumerate(zip(pairs_image, pairs_point)):
         F = estimate_fundamental_matrix(pair_point)
-        print('F =')
+        path = os.path.join(
+            options['root_stereo_sample'], 'scene{}_F.npy'.format(i))
+        print('F for scene {} ({}) = '.format(i, path))
         print(F)
+        np.save(path, F)
+
+
+def get_essential_matrix(K, F):
+    """
+    Calculate essential matrix from a intrinsic matrix K and 
+    a fundamental matrix F
+    """
+    return K.T @ F @ K
+
+
+def main_essential():
+    """
+    Calculate essential matrix
+
+    Task 1-5
+    """
+    print('--------------------------------------------------------------------')
+    print('Task 1-5')
+    print('--------------------------------------------------------------------')
+    Fs = get_all_F(options['root_stereo_sample'])
+    K = np.load(os.path.join(options['root_checker_sample'], 'K.npy'))
+
+    for i, F in enumerate(Fs):
+        E = get_essential_matrix(K, F)
+        path = os.path.join(
+            options['root_stereo_sample'], 'scene{}_E.npy'.format(i))
+        print('E for scene{} ({})= '.format(i, path))
+        print(E)
+        np.save(path, E)
+
+
+def decompose_essential_matrix(E):
+    """
+    Decompose essential matrix into rotation R and translation t
+
+    returns 4 possible combination of transformations
+
+    Returns)
+    list((np.ndarray(shape=(3,3), dtype=np.float32), 
+          np.ndarray(shape=(3,), dtype=np.float32)))
+    """
+    u, s, vh = np.linalg.svd(E)
+    print('s=')
+    print(s)
+    u = np.matrix(u)
+    vh = np.matrix(vh)
+    W = np.matrix([[0.0, -1.0, 0.0],
+                   [1.0, 0.0, 0.0],
+                   [0.0, 0.0, 1.0]])
+
+    Rs = [np.array(u @ W @ vh), np.array(u @ W.T @ vh)]
+    ts = [-u[:, 2].A1, u[:, 2].A1]
+
+    return list(product(Rs, ts))
+
+
+def main_decomposition():
+    """
+    Decompose essential matrix into rotation matrix R and translation t
+    """
+    print('--------------------------------------------------------------------')
+    print('Task 1-6')
+    print('--------------------------------------------------------------------')
+    Es = get_all_E(options['root_stereo_sample'])
+    for i, E in enumerate(Es):
+        path = os.path.join(
+            options['root_stereo_sample'], 'scene{}_pose.npz'.format(i))
+        ms = decompose_essential_matrix(E)
+        assert len(ms) == 4
+        print('poses for scene {} ({})='.format(i, path))
+        for j, (R, t) in enumerate(ms):
+            print('option {} R:'.format(j))
+            print(R)
+            print('option {} t:'.format(j))
+            print(t)
+        np.savez(path,
+                 R0=ms[0][0], t0=ms[0][1],
+                 R1=ms[1][0], t1=ms[1][1],
+                 R2=ms[2][0], t2=ms[2][1],
+                 R3=ms[3][0], t3=ms[3][1])
+
+
+"""
+-------------------------------------------------------------------------------
+Stereo matching
+-------------------------------------------------------------------------------
+"""
+
+
+def rectify_images(im1, im2, K, distcoeffs, R, t):
+    """
+    Calculate rectified images
+    """
+    R1, R2, P1, P2, Q, ROI1, ROI2 = cv2.stereoRectify(
+        K, distcoeffs, K, distcoeffs, (WIDTH_IMAGE, HEIGHT_IMAGE), R, t)
+
+    map1, map2 = cv2.initUndistortRectifyMap(
+        K, distcoeffs, R1, K, (WIDTH_IMAGE, HEIGHT_IMAGE), cv2.CV_32FC2)
+    rectified_left = cv2.remap(im1, map1, map2, cv2.INTER_LINEAR)
+    map1, map2 = cv2.initUndistortRectifyMap(
+        K, distcoeffs, R2, K, (WIDTH_IMAGE, HEIGHT_IMAGE), cv2.CV_32FC2)
+    rectified_right = cv2.remap(im2, map1, map2, cv2.INTER_LINEAR)
+
+    return rectified_left, rectified_right
+
+def draw_horizontal_lines(im):
+    """
+    Draw red horizontal lines on image for visualization
+    """
+    im = im.copy()
+    NUM_LINES = 20
+    interval = HEIGHT_IMAGE // NUM_LINES
+    for i in range(NUM_LINES):
+        cv2.line(im, (0, interval*i), (WIDTH_IMAGE, interval*i), (255, 255, 255))
+    return im
+
+def visualize_rectified_image_pair(im1, im2):
+    """
+    Create a merged image with horizontal lines on them
+    """
+    return np.hstack(
+        (draw_horizontal_lines(im1), 
+         draw_horizontal_lines(im2)))
+        
+
+def main_rectify():
+    prepare_root_inter(options['root_rectify_inter'])
+    K = np.load(os.path.join(options['root_checker_sample'], 'K.npy'))
+    distcoeffs = np.load(os.path.join(
+        options['root_checker_sample'], 'dist.npy'))
+    pair_images = get_all_scene_images(options['root_stereo_sample'])
+    ms = get_all_pose(options['root_stereo_sample'])
+    for i, ((image_left, image_right), m) in enumerate(zip(pair_images, ms)):
+        Ts = [
+            (m['R0'], m['t0']),
+            (m['R1'], m['t1']),
+            (m['R2'], m['t2']),
+            (m['R3'], m['t3'])]
+        for j, (R, t) in enumerate(Ts):
+            rectified_left, rectified_right = \
+                rectify_images(image_left, image_right, K, distcoeffs, R, t)
+            path = os.path.join(
+                options['root_rectify_inter'], 'scene{}_option{}.jpg'.format(i, j))
+            print('Rectified images are stored in ({})'.format(path))
+            cv2.imwrite(
+                path, visualize_rectified_image_pair(rectified_left, rectified_right))
 
 
 """
@@ -662,6 +891,9 @@ main
 """
 
 if __name__ == '__main__':
-    #main_camera_intrinsic()
-    main_feature_matching()
-    main_fundamental_matrix()
+    # main_camera_intrinsic()
+    # main_feature_matching()     # Task 1-3
+    # main_fundamental()          # Task 1-4
+    # main_essential()            # Task 1-5
+    # main_decomposition()        # Task 1-6
+    main_rectify()              # Task 2-1
